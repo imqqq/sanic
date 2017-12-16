@@ -24,7 +24,7 @@ try:
 except ImportError:
     async_loop = asyncio
 
-from sanic.log import log, netlog
+from sanic.log import logger, access_logger
 from sanic.response import HTTPResponse
 from sanic.request import Request
 from sanic.exceptions import (
@@ -67,8 +67,8 @@ class HttpProtocol(asyncio.Protocol):
         'request_handler', 'request_timeout', 'response_timeout',
         'keep_alive_timeout', 'request_max_size', 'request_class',
         'is_request_stream', 'router',
-        # enable or disable access log / error log purpose
-        'has_log',
+        # enable or disable access log purpose
+        'access_log',
         # connection management
         '_total_request_size', '_request_timeout_handler',
         '_response_timeout_handler', '_keep_alive_timeout_handler',
@@ -76,8 +76,8 @@ class HttpProtocol(asyncio.Protocol):
 
     def __init__(self, *, loop, request_handler, error_handler,
                  signal=Signal(), connections=set(), request_timeout=60,
-                 response_timeout=60, keep_alive_timeout=15,
-                 request_max_size=None, request_class=None, has_log=True,
+                 response_timeout=60, keep_alive_timeout=5,
+                 request_max_size=None, request_class=None, access_log=True,
                  keep_alive=True, is_request_stream=False, router=None,
                  state=None, debug=False, **kwargs):
         self.loop = loop
@@ -88,7 +88,7 @@ class HttpProtocol(asyncio.Protocol):
         self.headers = None
         self.router = router
         self.signal = signal
-        self.has_log = has_log
+        self.access_log = access_log
         self.connections = connections
         self.request_handler = request_handler
         self.error_handler = error_handler
@@ -190,8 +190,9 @@ class HttpProtocol(asyncio.Protocol):
                                      self.keep_alive_timeout_callback)
             )
         else:
-            log.info('KeepAlive Timeout. Closing connection.')
+            logger.info('KeepAlive Timeout. Closing connection.')
             self.transport.close()
+            self.transport = None
 
     # -------------------------------------------- #
     # Parsing
@@ -300,6 +301,29 @@ class HttpProtocol(asyncio.Protocol):
     # -------------------------------------------- #
     # Responding
     # -------------------------------------------- #
+    def log_response(self, response):
+        if self.access_log:
+            extra = {
+                'status': getattr(response, 'status', 0),
+            }
+
+            if isinstance(response, HTTPResponse):
+                extra['byte'] = len(response.body)
+            else:
+                extra['byte'] = -1
+
+            extra['host'] = 'UNKNOWN'
+            if self.request is not None:
+                if self.request.ip:
+                    extra['host'] = '{0[0]}:{0[1]}'.format(self.request.ip)
+
+                extra['request'] = '{0} {1}'.format(self.request.method,
+                                                    self.request.url)
+            else:
+                extra['request'] = 'nil'
+
+            access_logger.info('', extra=extra)
+
     def write_response(self, response):
         """
         Writes response content synchronously to the transport.
@@ -313,25 +337,17 @@ class HttpProtocol(asyncio.Protocol):
                 response.output(
                     self.request.version, keep_alive,
                     self.keep_alive_timeout))
-            if self.has_log:
-                netlog.info('', extra={
-                    'status': response.status,
-                    'byte': len(response.body),
-                    'host': '{0}:{1}'.format(self.request.ip[0],
-                                             self.request.ip[1]),
-                    'request': '{0} {1}'.format(self.request.method,
-                                                self.request.url)
-                })
+            self.log_response(response)
         except AttributeError:
-            log.error(
-                ('Invalid response object for url {}, '
-                 'Expected Type: HTTPResponse, Actual Type: {}').format(
-                    self.url, type(response)))
+            logger.error('Invalid response object for url %s, '
+                         'Expected Type: HTTPResponse, Actual Type: %s',
+                         self.url, type(response))
             self.write_error(ServerError('Invalid response type'))
         except RuntimeError:
-            log.error(
-                'Connection lost before response written @ {}'.format(
-                    self.request.ip))
+            if self._debug:
+                logger.error('Connection lost before response written @ %s',
+                             self.request.ip)
+            keep_alive = False
         except Exception as e:
             self.bail_out(
                 "Writing response failed, connection closed {}".format(
@@ -339,6 +355,7 @@ class HttpProtocol(asyncio.Protocol):
         finally:
             if not keep_alive:
                 self.transport.close()
+                self.transport = None
             else:
                 self._keep_alive_timeout_handler = self.loop.call_later(
                     self.keep_alive_timeout,
@@ -360,25 +377,17 @@ class HttpProtocol(asyncio.Protocol):
             response.transport = self.transport
             await response.stream(
                 self.request.version, keep_alive, self.keep_alive_timeout)
-            if self.has_log:
-                netlog.info('', extra={
-                    'status': response.status,
-                    'byte': -1,
-                    'host': '{0}:{1}'.format(self.request.ip[0],
-                                             self.request.ip[1]),
-                    'request': '{0} {1}'.format(self.request.method,
-                                                self.request.url)
-                })
+            self.log_response(response)
         except AttributeError:
-            log.error(
-                ('Invalid response object for url {}, '
-                 'Expected Type: HTTPResponse, Actual Type: {}').format(
-                    self.url, type(response)))
+            logger.error('Invalid response object for url %s, '
+                         'Expected Type: HTTPResponse, Actual Type: %s',
+                         self.url, type(response))
             self.write_error(ServerError('Invalid response type'))
         except RuntimeError:
-            log.error(
-                'Connection lost before response written @ {}'.format(
-                    self.request.ip))
+            if self._debug:
+                logger.error('Connection lost before response written @ %s',
+                             self.request.ip)
+            keep_alive = False
         except Exception as e:
             self.bail_out(
                 "Writing response failed, connection closed {}".format(
@@ -386,6 +395,7 @@ class HttpProtocol(asyncio.Protocol):
         finally:
             if not keep_alive:
                 self.transport.close()
+                self.transport = None
             else:
                 self._keep_alive_timeout_handler = self.loop.call_later(
                     self.keep_alive_timeout,
@@ -405,47 +415,30 @@ class HttpProtocol(asyncio.Protocol):
             version = self.request.version if self.request else '1.1'
             self.transport.write(response.output(version))
         except RuntimeError:
-            log.error(
-                'Connection lost before error written @ {}'.format(
-                    self.request.ip if self.request else 'Unknown'))
+            if self._debug:
+                logger.error('Connection lost before error written @ %s',
+                             self.request.ip if self.request else 'Unknown')
         except Exception as e:
             self.bail_out(
                 "Writing error failed, connection closed {}".format(
                     repr(e)), from_error=True
             )
         finally:
-            if self.has_log:
-                extra = dict()
-                if isinstance(response, HTTPResponse):
-                    extra['status'] = response.status
-                    extra['byte'] = len(response.body)
-                else:
-                    extra['status'] = 0
-                    extra['byte'] = -1
-                if self.request:
-                    extra['host'] = '%s:%d' % self.request.ip,
-                    extra['request'] = '%s %s' % (self.request.method,
-                                                  self.url)
-                else:
-                    extra['host'] = 'UNKNOWN'
-                    extra['request'] = 'nil'
-                if self.parser and not (self.keep_alive
-                                        and extra['status'] == 408):
-                    netlog.info('', extra=extra)
+            if self.parser and (self.keep_alive
+                                or getattr(response, 'status', 0) == 408):
+                self.log_response(response)
             self.transport.close()
 
     def bail_out(self, message, from_error=False):
         if from_error or self.transport.is_closing():
-            log.error(
-                ("Transport closed @ {} and exception "
-                 "experienced during error handling").format(
-                    self.transport.get_extra_info('peername')))
-            log.debug(
-                'Exception:\n{}'.format(traceback.format_exc()))
+            logger.error("Transport closed @ %s and exception "
+                         "experienced during error handling",
+                         self.transport.get_extra_info('peername'))
+            logger.debug('Exception:\n%s', traceback.format_exc())
         else:
             exception = ServerError(message)
             self.write_error(exception)
-            log.error(message)
+            logger.error(message)
 
     def cleanup(self):
         """This is called when KeepAlive feature is used,
@@ -505,11 +498,11 @@ def trigger_events(events, loop):
 
 def serve(host, port, request_handler, error_handler, before_start=None,
           after_start=None, before_stop=None, after_stop=None, debug=False,
-          request_timeout=60, response_timeout=60, keep_alive_timeout=60,
+          request_timeout=60, response_timeout=60, keep_alive_timeout=5,
           ssl=None, sock=None, request_max_size=None, reuse_port=False,
           loop=None, protocol=HttpProtocol, backlog=100,
           register_sys_signals=True, run_async=False, connections=None,
-          signal=Signal(), request_class=None, has_log=True,
+          signal=Signal(), request_class=None, access_log=True,
           keep_alive=True, is_request_stream=False, router=None,
           websocket_max_size=None, websocket_max_queue=None, state=None,
           graceful_shutdown_timeout=15.0):
@@ -531,6 +524,8 @@ def serve(host, port, request_handler, error_handler, before_start=None,
                        `app` instance and `loop`
     :param debug: enables debug output (slows server)
     :param request_timeout: time in seconds
+    :param response_timeout: time in seconds
+    :param keep_alive_timeout: time in seconds
     :param ssl: SSLContext
     :param sock: Socket for the server to accept connections from
     :param request_max_size: size in bytes, `None` for no limit
@@ -538,7 +533,7 @@ def serve(host, port, request_handler, error_handler, before_start=None,
     :param loop: asyncio compatible event loop
     :param protocol: subclass of asyncio protocol class
     :param request_class: Request class to use
-    :param has_log: disable/enable access log and error log
+    :param access_log: disable/enable access log
     :param is_request_stream: disable/enable Request.stream
     :param router: Router object
     :return: Nothing
@@ -563,7 +558,7 @@ def serve(host, port, request_handler, error_handler, before_start=None,
         keep_alive_timeout=keep_alive_timeout,
         request_max_size=request_max_size,
         request_class=request_class,
-        has_log=has_log,
+        access_log=access_log,
         keep_alive=keep_alive,
         is_request_stream=is_request_stream,
         router=router,
@@ -594,8 +589,8 @@ def serve(host, port, request_handler, error_handler, before_start=None,
 
     try:
         http_server = loop.run_until_complete(server_coroutine)
-    except:
-        log.exception("Unable to start server")
+    except BaseException:
+        logger.exception("Unable to start server")
         return
 
     trigger_events(after_start, loop)
@@ -606,14 +601,14 @@ def serve(host, port, request_handler, error_handler, before_start=None,
             try:
                 loop.add_signal_handler(_signal, loop.stop)
             except NotImplementedError:
-                log.warn('Sanic tried to use loop.add_signal_handler but it is'
-                         ' not implemented on this platform.')
+                logger.warning('Sanic tried to use loop.add_signal_handler '
+                               'but it is not implemented on this platform.')
     pid = os.getpid()
     try:
-        log.info('Starting worker [{}]'.format(pid))
+        logger.info('Starting worker [%s]', pid)
         loop.run_forever()
     finally:
-        log.info("Stopping worker [{}]".format(pid))
+        logger.info("Stopping worker [%s]", pid)
 
         # Run the on_stop function if provided
         trigger_events(before_stop, loop)
@@ -641,7 +636,9 @@ def serve(host, port, request_handler, error_handler, before_start=None,
         coros = []
         for conn in connections:
             if hasattr(conn, "websocket") and conn.websocket:
-                coros.append(conn.websocket.close_connection(force=True))
+                coros.append(
+                    conn.websocket.close_connection(after_handshake=True)
+                )
             else:
                 conn.close()
 
@@ -675,8 +672,7 @@ def serve_multiple(server_settings, workers):
         server_settings['port'] = None
 
     def sig_handler(signal, frame):
-        log.info("Received signal {}. Shutting down.".format(
-            Signals(signal).name))
+        logger.info("Received signal %s. Shutting down.", Signals(signal).name)
         for process in processes:
             os.kill(process.pid, SIGINT)
 

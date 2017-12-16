@@ -1,5 +1,6 @@
 import sys
 import json
+import socket
 from cgi import parse_header
 from collections import namedtuple
 from http.cookies import SimpleCookie
@@ -17,7 +18,7 @@ except ImportError:
         json_loads = json.loads
 
 from sanic.exceptions import InvalidUsage
-from sanic.log import log
+from sanic.log import error_logger
 
 DEFAULT_HTTP_CONTENT_TYPE = "application/octet-stream"
 
@@ -46,7 +47,8 @@ class Request(dict):
     __slots__ = (
         'app', 'headers', 'version', 'method', '_cookies', 'transport',
         'body', 'parsed_json', 'parsed_args', 'parsed_form', 'parsed_files',
-        '_ip', '_parsed_url', 'uri_template', 'stream', '_remote_addr'
+        '_ip', '_parsed_url', 'uri_template', 'stream', '_remote_addr',
+        '_socket', '_port'
     )
 
     def __init__(self, url_bytes, headers, version, method, transport):
@@ -127,7 +129,7 @@ class Request(dict):
                     self.parsed_form, self.parsed_files = (
                         parse_multipart_form(self.body, boundary))
             except Exception:
-                log.exception("Failed when parsing form")
+                error_logger.exception("Failed when parsing form")
 
         return self.parsed_form
 
@@ -167,10 +169,35 @@ class Request(dict):
 
     @property
     def ip(self):
-        if not hasattr(self, '_ip'):
-            self._ip = (self.transport.get_extra_info('peername') or
-                        (None, None))
+        if not hasattr(self, '_socket'):
+            self._get_address()
         return self._ip
+
+    @property
+    def port(self):
+        if not hasattr(self, '_socket'):
+            self._get_address()
+        return self._port
+
+    @property
+    def socket(self):
+        if not hasattr(self, '_socket'):
+            self._get_socket()
+        return self._socket
+
+    def _get_address(self):
+        sock = self.transport.get_extra_info('socket')
+
+        if sock.family == socket.AF_INET:
+            self._socket = (self.transport.get_extra_info('peername') or
+                            (None, None))
+            self._ip, self._port = self._socket
+        elif sock.family == socket.AF_INET6:
+            self._socket = (self.transport.get_extra_info('peername') or
+                            (None, None, None, None))
+            self._ip, self._port, *_ = self._socket
+        else:
+            self._ip, self._port = (None, None)
 
     @property
     def remote_addr(self):
